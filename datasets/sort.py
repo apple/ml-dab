@@ -3,6 +3,7 @@
 # Copyright (C) 2019-2020 Apple Inc. All Rights Reserved.
 #
 import torch
+import torch.utils.data
 import numpy as np
 
 

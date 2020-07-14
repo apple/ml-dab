@@ -2,7 +2,6 @@
 # For licensing see accompanying LICENSE.txt file.
 # Copyright (C) 2019-2020 Apple Inc. All Rights Reserved.
 #
-import os
 import time
 import torch
 import pprint
@@ -13,11 +12,11 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from copy import deepcopy
 
-from models.jit import IndependentJITApproximator, IndependentVectorizedApproximator
+from models.approximator import IndependentVectorizedApproximator
 from models.dab import DAB, SignumWithMargin, View
 from datasets.sort import SortLoader
+
 
 parser = argparse.ArgumentParser(description='DAB Sort Dense Example')
 
@@ -52,18 +51,10 @@ parser.add_argument('--ngpu', type=int, default=1,
                     help='number of gpus available (default: 1)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
-parser.add_argument('--half', action='store_true', default=False,
-                    help='enables half precision training')
-parser.add_argument('--plot', action='store_true', default=False,
-                    help='show plots when done')
-
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 if args.cuda:
     torch.backends.cudnn.benchmark = True
-
-if args.plot:
-    import matplotlib.pyplot as plt
 
 # set a fixed seed for GPUs and CPU
 if args.seed is not None:
@@ -120,7 +111,7 @@ def build_model(args):
 
     """
     if args.approximator_type == 'batch':
-        approximator = nn.Sequential( # layers
+        approximator = nn.Sequential(  # moar layers
             nn.Linear(args.latent_size, args.latent_size // 2),
             nn.Tanh(),
             nn.Linear(args.latent_size // 2, args.latent_size // 2),
@@ -130,14 +121,10 @@ def build_model(args):
     elif args.approximator_type == 'independent':
         approximator = IndependentVectorizedApproximator(args.latent_size,
                                                          activation=nn.Tanh)
-    elif args.approximator_type == 'independent_jit':
-        approximator = IndependentJITApproximator(args.latent_size,
-                                                  args.sequence_length,
-                                                  activation=nn.Tanh)
     else:
         raise Exception("unknown approximator type, specify independent or batch")
 
-    model = nn.Sequential( # even more layers
+    model = nn.Sequential(  # even moar layers
         View([-1, args.sequence_length]),
         nn.Linear(args.sequence_length, args.latent_size // 2),
         nn.Tanh(),
@@ -145,10 +132,8 @@ def build_model(args):
         nn.Tanh(),
         nn.Linear(args.latent_size // 2, args.latent_size),
         nn.Tanh(),
-        DAB(
-            approximator=approximator, 
-            hard_layer=SignumWithMargin()
-        ),
+        DAB(approximator=approximator,
+            hard_layer=SignumWithMargin()),
         nn.Linear(args.latent_size, args.sequence_length * args.sequence_length),
         View([-1, args.sequence_length, args.sequence_length])
     )
@@ -187,10 +172,13 @@ def get_dab_loss(model):
         if isinstance(layer, DAB):
             dab_count += 1
             if dab_loss is None:
-               dab_loss = layer.loss_function()
+                dab_loss = layer.loss_function()
             else:
                 dab_loss += layer.loss_function()
 
+    dab_count = 1 if dab_count == 0 else dab_count
+    dab_loss = torch.zeros(args.batch_size) if dab_loss is None else dab_loss
+    dab_loss = dab_loss.cuda() if args.cuda else dab_loss
     return dab_loss / dab_count
 
 
@@ -226,9 +214,6 @@ def execute_graph(epoch, model, loader, optimizer=None, prefix='test'):
     for minibatch, labels in loader:
         minibatch = minibatch.cuda() if args.cuda else minibatch
         labels = labels.cuda() if args.cuda else labels
-        if args.half:
-            minibatch = minibatch.half()
-
         if 'train' in prefix:
             optimizer.zero_grad()                                                  # zero gradients
 
@@ -242,7 +227,6 @@ def execute_graph(epoch, model, loader, optimizer=None, prefix='test'):
 
             loss += loss_t.item()                                                  # add to aggregate loss
             dab_loss += torch.mean(dab_loss_t).item()
-            # print(loss, dab_loss)
             accuracy += all_or_none_accuracy(preds=F.softmax(pred_logits, dim=1),  # get accuracy value
                                              targets=labels, dim=1)
             num_samples += minibatch.size(0)
@@ -251,9 +235,8 @@ def execute_graph(epoch, model, loader, optimizer=None, prefix='test'):
             loss_t.backward()
             optimizer.step()
 
-        if args.debug_step: # for testing purposes
+        if args.debug_step:  # for testing purposes
             break
-
 
     # debug prints for a ** SINGLE ** sample, loss above is calculated over entire minibatch
     print('preds[0]\t =\t ', F.softmax(pred_logits[0], dim=1).max(dim=1)[1])
@@ -272,15 +255,7 @@ def execute_graph(epoch, model, loader, optimizer=None, prefix='test'):
         loss, dab_loss, accuracy * 100.0))
 
     # return this for early stopping if used
-    return {
-        'prefix': prefix,
-        'num_samples': num_samples,
-        'epoch': epoch,
-        'loss': loss,
-        'dab_loss': dab_loss,
-        'accuracy': accuracy,
-        'elapsed': time.time() - start_time,
-    }
+    return loss
 
 
 def train(epoch, model, optimizer, train_loader, prefix='train'):
@@ -324,16 +299,9 @@ def run(args):
     optimizer = build_optimizer(model, args)  # the optimizer for the model
 
     # main training loop
-    test_results = []
     for epoch in range(1, args.epochs + 1):
         train(epoch, model, optimizer, loader.train_loader)
-        test_results.append(test(epoch, model, loader.test_loader))
-
-    if args.plot:
-        x = [r['epoch'] for r in test_results]
-        y = [r['accuracy'] for r in test_results]
-        plt.plot(x, y)
-        plt.show()
+        test(epoch, model, loader.test_loader)
 
 
 if __name__ == "__main__":
